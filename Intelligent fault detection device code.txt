@@ -1,0 +1,1259 @@
+// ============================================================
+// INTELLIGENT FALL DETECTION SYSTEM
+// ESP32 DevKit V1 + MPU6050 + A7670C + I2C LCD + BUZZER
+//
+// Features:
+// 1. Three-trigger fall detection
+// 2. MPU6050 acceleration and gyroscope readings
+// 3. LCD status display
+// 4. Buzzer alarm
+// 5. SMS alert through A7670C
+// 6. Faster LCD update after SMS submission
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HardwareSerial.h>
+#include <TinyGPSPlus.h>
+#include <math.h>
+
+// ================= PIN CONFIGURATION =================
+
+// GPS module (existing wiring)
+#define GPS_RX 19
+#define GPS_TX 23
+#define GPS_BAUD 9600
+
+// A7670C GSM module
+#define MODEM_RX 18
+#define MODEM_TX 15
+#define MODEM_BAUD 115200
+
+// I2C bus shared by MPU6050 and LCD
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// Buzzer
+#define BUZZER_PIN 5
+
+// Push button: connect one side to GPIO 14 and the other side to GND.
+// INPUT_PULLUP means LOW = pressed.
+#define BUTTON_PIN 14
+
+// Hall Effect sensor: magnet present = belt closed
+#define HALL_PIN 13
+const int HALL_CLOSED_STATE = LOW;   // LOW = belt closed; HIGH = belt open.
+
+// Capacitive sensor. GPIO 27 is used on classic ESP32 DevKit V1.
+// Avoid GPIO 10 on this board because it is commonly connected to flash.
+#define CAP_PIN 27
+const int CAP_DETECTED_STATE = HIGH; // HIGH = human/contact detected.
+
+// SMS recipient
+const char ADMIN_NUMBER[] = "+919535677271";
+
+// ================= OBJECTS =================
+
+HardwareSerial SerialAT(1);
+HardwareSerial GPS_Serial(2);
+TinyGPSPlus gps;
+
+// Change 0x27 to 0x3F if your LCD uses that address.
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= MPU6050 =================
+
+const int MPU_addr = 0x68;
+
+int16_t AcX, AcY, AcZ;
+int16_t Tmp, GyX, GyY, GyZ;
+
+float ax = 0;
+float ay = 0;
+float az = 0;
+
+float gx = 0;
+float gy = 0;
+float gz = 0;
+
+bool mpuOK = false;
+bool modemOK = false;
+
+bool fall = false;
+
+bool trigger1 = false;
+bool trigger2 = false;
+bool trigger3 = false;
+
+byte trigger1count = 0;
+byte trigger2count = 0;
+byte trigger3count = 0;
+
+int angleChange = 0;
+
+// ================= SYSTEM SETTINGS =================
+
+const unsigned long FALL_COOLDOWN = 15000;
+
+unsigned long lastFallTime = 0;
+
+bool smsInProgress = false;
+
+// Hall and capacitive sensor states. Both must be valid to enable fall detection.
+int hallValue = LOW;
+bool hallClosed = false;
+bool previousHallClosed = false;
+int capacitiveValue = LOW;
+bool humanDetected = false;
+bool previousHumanDetected = false;
+unsigned long lastHallStatusPrint = 0;
+unsigned long lastCapStatusPrint = 0;
+unsigned long lastBeltLCDUpdate = 0;
+bool beltLCDInitialized = false;
+bool lastBeltLCDClosed = false;
+bool lastLCDHumanDetected = false;
+
+// Push-button alarm acknowledgement and non-blocking 30-minute alarm
+const unsigned long ALARM_DURATION = 30UL * 60UL * 1000UL;
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
+bool alarmActive = false;
+bool fallAcknowledged = false;
+bool personOKDisplayActive = false;
+unsigned long alarmStartedAt = 0;
+unsigned long personOKDisplayUntil = 0;
+int lastButtonReading = HIGH;
+int stableButtonState = HIGH;
+unsigned long lastButtonChange = 0;
+
+// ================= FUNCTION DECLARATIONS =================
+
+String readResponse(unsigned long timeout);
+
+String waitForSMSResult(unsigned long timeout);
+
+bool sendAT(
+  const char *command,
+  unsigned long timeout = 3000
+);
+
+bool sendSMS(const char *message);
+
+bool mpu_read();
+
+void checkFall();
+void readHallSensor();
+void readCapacitiveSensor();
+void updateBeltLCD();
+void serviceAlarmAndButton();
+void resetFallSequence();
+
+void buzzerAlarm();
+void readGPSData();
+String getGPSMessage();
+
+void showLCD(
+  const char *line1,
+  const char *line2
+);
+
+// ============================================================
+// LCD DISPLAY
+// ============================================================
+
+void showLCD(const char *line1, const char *line2)
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+// ============================================================
+// READ MODEM RESPONSE
+//
+// Returns immediately when an AT command response completes.
+// This avoids waiting for the entire timeout unnecessarily.
+// ============================================================
+
+String readResponse(unsigned long timeout)
+{
+  String response = "";
+
+  unsigned long start = millis();
+
+  while (millis() - start < timeout)
+  {
+    serviceAlarmAndButton();
+    while (SerialAT.available())
+    {
+      char c = SerialAT.read();
+
+      Serial.write(c);
+      response += c;
+
+      // SMS composition prompt
+      if (response.indexOf(">") >= 0)
+      {
+        return response;
+      }
+
+      // Normal AT command success
+      if (response.indexOf("OK") >= 0)
+      {
+        return response;
+      }
+
+      // Modem error
+      if (response.indexOf("ERROR") >= 0)
+      {
+        return response;
+      }
+    }
+
+    delay(1);
+  }
+
+  return response;
+}
+
+// ============================================================
+// WAIT FOR SMS SUBMISSION RESULT
+//
+// Waits for +CMGS or an error.
+// Does not wait the entire timeout if a result arrives early.
+// ============================================================
+
+String waitForSMSResult(unsigned long timeout)
+{
+  String response = "";
+
+  unsigned long start = millis();
+
+  while (millis() - start < timeout)
+  {
+    serviceAlarmAndButton();
+    while (SerialAT.available())
+    {
+      char c = SerialAT.read();
+
+      Serial.write(c);
+      response += c;
+
+      // SMS accepted for submission
+      if (response.indexOf("+CMGS:") >= 0)
+      {
+        return response;
+      }
+
+      // SMS submission error
+      if (response.indexOf("+CMS ERROR:") >= 0 ||
+          response.indexOf("ERROR") >= 0)
+      {
+        return response;
+      }
+    }
+
+    delay(1);
+  }
+
+  return response;
+}
+
+// ============================================================
+// SEND AT COMMAND
+// ============================================================
+
+bool sendAT(
+  const char *command,
+  unsigned long timeout
+)
+{
+  // Remove old input from the UART buffer
+  while (SerialAT.available())
+  {
+    SerialAT.read();
+  }
+
+  Serial.print("\nCommand: ");
+  Serial.println(command);
+
+  SerialAT.print(command);
+  SerialAT.print("\r\n");
+
+  String response = readResponse(timeout);
+
+  if (response.indexOf("OK") >= 0)
+  {
+    Serial.println("\nAT command successful.");
+    return true;
+  }
+
+  Serial.println("\nNo OK response received.");
+
+  return false;
+}
+
+// ============================================================
+// SEND SMS
+// ============================================================
+
+bool sendSMS(const char *message)
+{
+  if (!modemOK)
+  {
+    Serial.println(
+      "GSM modem not ready. SMS not sent."
+    );
+
+    return false;
+  }
+
+  smsInProgress = true;
+
+  Serial.println("\nPreparing SMS...");
+
+  // Enable SMS text mode
+  if (!sendAT("AT+CMGF=1", 3000))
+  {
+    Serial.println(
+      "Unable to enable SMS text mode."
+    );
+
+    smsInProgress = false;
+
+    return false;
+  }
+
+  // Clear remaining received data
+  while (SerialAT.available())
+  {
+    SerialAT.read();
+  }
+
+  // Request recipient number
+  SerialAT.print("AT+CMGS=\"");
+  SerialAT.print(ADMIN_NUMBER);
+  SerialAT.print("\"\r\n");
+
+  // Wait for the SMS prompt
+  String response = readResponse(10000);
+
+  if (response.indexOf(">") < 0)
+  {
+    Serial.println(
+      "\nSMS prompt not received."
+    );
+
+    smsInProgress = false;
+
+    return false;
+  }
+
+  // Send the SMS text
+  SerialAT.print(message);
+
+  // Ctrl+Z submits the SMS
+  SerialAT.write(26);
+
+  Serial.println(
+    "\nWaiting for SMS confirmation..."
+  );
+
+  // Wait up to 20 seconds, returning sooner
+  // if the modem confirms SMS submission.
+  response = waitForSMSResult(20000);
+
+  bool success =
+    response.indexOf("+CMGS:") >= 0 &&
+    response.indexOf("ERROR") < 0;
+
+  if (success)
+  {
+    Serial.println(
+      "\nSMS submitted successfully."
+    );
+  }
+  else
+  {
+    Serial.println("\nSMS failed or confirmation timed out.");
+    Serial.println("Full modem response:");
+    Serial.println(response);
+    Serial.print("SMS text length: ");
+    Serial.println(String(message).length());
+  }
+
+  smsInProgress = false;
+
+  return success;
+}
+
+// ============================================================
+// GPS DATA
+// ============================================================
+
+void readGPSData()
+{
+  while (GPS_Serial.available())
+  {
+    gps.encode(GPS_Serial.read());
+  }
+}
+
+String getGPSMessage()
+{
+  // Process any GPS data already waiting in the UART buffer.
+  readGPSData();
+
+  if (gps.location.isValid() && gps.location.age() < 15000)
+  {
+    String lat = String(gps.location.lat(), 6);
+    String lon = String(gps.location.lng(), 6);
+
+    // Keep the complete SMS short enough for a single standard SMS.
+    // Avoid unnecessary labels and duplicate coordinates.
+    String msg = " Lat:";
+    msg += lat;
+    msg += " Lon:";
+    msg += lon;
+    msg += " Map:https://maps.google.com/?q=";
+    msg += lat;
+    msg += ",";
+    msg += lon;
+
+    return msg;
+  }
+
+  return " GPS unavailable; check tracker.";
+}
+
+// ============================================================
+// BUZZER ALARM + PUSH-BUTTON ACKNOWLEDGEMENT
+// ============================================================
+
+// Start a continuous alarm. It is stopped by the button or after 30 minutes.
+void buzzerAlarm()
+{
+  alarmActive = true;
+  alarmStartedAt = millis();
+  digitalWrite(BUZZER_PIN, HIGH);
+  Serial.println("BUZZER ALARM ACTIVE - maximum duration 30 minutes");
+}
+
+// Clear all partial trigger states so monitoring starts from Trigger 1 again.
+void resetFallSequence()
+{
+  fall = false;
+  trigger1 = false;
+  trigger2 = false;
+  trigger3 = false;
+  trigger1count = 0;
+  trigger2count = 0;
+  trigger3count = 0;
+  angleChange = 0;
+  lastFallTime = 0;
+}
+
+// Call frequently from loop and modem-wait routines.
+void serviceAlarmAndButton()
+{
+  // Non-blocking button debounce
+  int reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonReading)
+  {
+    lastButtonChange = millis();
+    lastButtonReading = reading;
+  }
+
+  if ((millis() - lastButtonChange) >= BUTTON_DEBOUNCE_MS &&
+      reading != stableButtonState)
+  {
+    stableButtonState = reading;
+
+    // Act only on the press edge, and only if an alarm is active.
+    if (stableButtonState == LOW && alarmActive)
+    {
+      alarmActive = false;
+      fallAcknowledged = true;
+      digitalWrite(BUZZER_PIN, LOW);
+
+      resetFallSequence();
+
+      personOKDisplayActive = true;
+      personOKDisplayUntil = millis() + 2500UL;
+
+      Serial.println("Alarm acknowledged by button.");
+      Serial.println("Buzzer OFF. Person is OK. Restarting monitoring.");
+
+      showLCD("Person is OK", "Monitoring again");
+    }
+  }
+
+  // Stop the continuous alarm automatically after 30 minutes.
+  if (alarmActive && (millis() - alarmStartedAt >= ALARM_DURATION))
+  {
+    alarmActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("30-minute alarm duration expired. Buzzer OFF.");
+    showLCD("Alarm Timeout", "Check person");
+  }
+
+  // Let the LCD return to normal belt/monitoring display after 2.5 seconds.
+  if (personOKDisplayActive && (long)(millis() - personOKDisplayUntil) >= 0)
+  {
+    personOKDisplayActive = false;
+    beltLCDInitialized = false; // force the belt status to refresh
+  }
+}
+
+// ============================================================
+// READ MPU6050
+// ============================================================
+
+bool mpu_read()
+{
+  Wire.beginTransmission(MPU_addr);
+
+  // Starting register: accelerometer X high byte
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0)
+  {
+    Serial.println(
+      "MPU6050 communication error."
+    );
+
+    return false;
+  }
+
+  int received = Wire.requestFrom(
+    MPU_addr,
+    14,
+    true
+  );
+
+  if (received != 14 || Wire.available() < 14)
+  {
+    Serial.println(
+      "MPU6050 read error."
+    );
+
+    return false;
+  }
+
+  AcX = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  AcY = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  AcZ = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  Tmp = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  GyX = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  GyY = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  GyZ = (int16_t)(
+    (Wire.read() << 8) | Wire.read()
+  );
+
+  return true;
+}
+
+// ============================================================
+// HALL EFFECT SENSOR: CHECK BELT STATUS
+// ============================================================
+
+void readHallSensor()
+{
+  hallValue = digitalRead(HALL_PIN);
+  hallClosed = (hallValue == HALL_CLOSED_STATE);
+
+  // Report only when status changes, or every 3 seconds.
+  if (hallClosed != previousHallClosed ||
+      millis() - lastHallStatusPrint >= 3000)
+  {
+    Serial.print("Hall value: ");
+    Serial.print(hallValue);
+    Serial.print(" | Belt: ");
+    Serial.println(hallClosed
+      ? "CLOSED - fall detection enabled"
+      : "OPEN - fall detection paused");
+
+    lastHallStatusPrint = millis();
+    previousHallClosed = hallClosed;
+  }
+}
+
+void readCapacitiveSensor()
+{
+  capacitiveValue = digitalRead(CAP_PIN);
+  humanDetected = (capacitiveValue == CAP_DETECTED_STATE);
+
+  if (humanDetected != previousHumanDetected ||
+      millis() - lastCapStatusPrint >= 3000)
+  {
+    Serial.print("Capacitive value: ");
+    Serial.print(capacitiveValue);
+    Serial.print(" | Human/contact: ");
+    Serial.println(humanDetected
+      ? "DETECTED - fall detection enabled if belt closed"
+      : "NOT DETECTED - fall detection paused");
+
+    lastCapStatusPrint = millis();
+    previousHumanDetected = humanDetected;
+  }
+}
+
+// Hall status is checked first; capacitive status is checked only when
+// the Hall sensor says the belt is closed.
+void updateBeltLCD()
+{
+  if (alarmActive || personOKDisplayActive)
+  {
+    return;
+  }
+
+  bool stateChanged = !beltLCDInitialized ||
+                      (hallClosed != lastBeltLCDClosed) ||
+                      (humanDetected != lastLCDHumanDetected);
+
+  // Priority 1: Hall sensor checks whether the belt is closed.
+  if (!hallClosed)
+  {
+    if (stateChanged || millis() - lastBeltLCDUpdate >= 3000)
+    {
+      showLCD("Belt: OPEN", "Connect the belt");
+      lastBeltLCDUpdate = millis();
+      lastBeltLCDClosed = false;
+      lastLCDHumanDetected = humanDetected;
+      beltLCDInitialized = true;
+    }
+    return;
+  }
+
+  // Priority 2: after belt closure, check the capacitive sensor.
+  if (!humanDetected)
+  {
+    if (stateChanged || millis() - lastBeltLCDUpdate >= 3000)
+    {
+      showLCD("Human: Not found", "Check contact");
+      lastBeltLCDUpdate = millis();
+      lastBeltLCDClosed = true;
+      lastLCDHumanDetected = false;
+      beltLCDInitialized = true;
+    }
+    return;
+  }
+
+  // Both sensors allow fall detection. When no trigger is active,
+  // show the normal monitoring state rather than only sensor status.
+  // Trigger 1/2/3, fall, and SMS screens are left unchanged.
+  if (!trigger1 && !trigger2 && !trigger3 && !fall && !smsInProgress)
+  {
+    if (stateChanged || millis() - lastBeltLCDUpdate >= 3000)
+    {
+      showLCD("Monitoring...", "No Fall Detected");
+      lastBeltLCDUpdate = millis();
+      lastBeltLCDClosed = true;
+      lastLCDHumanDetected = true;
+      beltLCDInitialized = true;
+    }
+  }
+}
+
+// ============================================================
+// THREE-TRIGGER FALL DETECTION
+// ============================================================
+
+void checkFall()
+{
+  // Run fall detection only when the belt is closed and human/contact is detected.
+  // Reset partial triggers if either condition becomes false.
+  if (!hallClosed || !humanDetected)
+  {
+    trigger1 = false;
+    trigger2 = false;
+    trigger3 = false;
+    trigger1count = 0;
+    trigger2count = 0;
+    trigger3count = 0;
+    fall = false;
+    return;
+  }
+
+  // Do not start a second fall sequence while the current alarm is active.
+  if (alarmActive)
+  {
+    return;
+  }
+
+  if (!mpuOK)
+  {
+    return;
+  }
+
+  if (!mpu_read())
+  {
+    return;
+  }
+
+  // Original calibration values
+  ax = (AcX - 2050) / 16384.00;
+  ay = (AcY - 77) / 16384.00;
+  az = (AcZ - 1947) / 16384.00;
+
+  gx = (GyX + 270) / 131.07;
+  gy = (GyY - 351) / 131.07;
+  gz = (GyZ + 136) / 131.07;
+
+  // Calculate acceleration magnitude
+  float Raw_Amp = sqrt(
+    pow(ax, 2) +
+    pow(ay, 2) +
+    pow(az, 2)
+  );
+
+  int Amp = Raw_Amp * 10;
+
+  Serial.print("Amp: ");
+  Serial.println(Amp);
+
+  // ----------------------------------------------------------
+  // TRIGGER 1: LOW ACCELERATION
+  // ----------------------------------------------------------
+
+  if (Amp <= 2 && trigger2 == false)
+  {
+    if (!trigger1)
+    {
+      trigger1 = true;
+
+      Serial.println(
+        "TRIGGER 1 ACTIVATED"
+      );
+
+      showLCD(
+        "TRIGGER 1 ACTIVE",
+        "Low Acceleration"
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // TRIGGER 2: HIGH ACCELERATION
+  // ----------------------------------------------------------
+
+  if (trigger1 == true)
+  {
+    trigger1count++;
+
+    if (Amp >= 12)
+    {
+      trigger2 = true;
+      trigger1 = false;
+      trigger1count = 0;
+
+      Serial.println(
+        "TRIGGER 2 ACTIVATED"
+      );
+
+      showLCD(
+        "TRIGGER 2 ACTIVE",
+        "High Acceleration"
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // TRIGGER 3: GYROSCOPE MAGNITUDE
+  // ----------------------------------------------------------
+
+  if (trigger2 == true)
+  {
+    trigger2count++;
+
+    angleChange = sqrt(
+      pow(gx, 2) +
+      pow(gy, 2) +
+      pow(gz, 2)
+    );
+
+    Serial.print("Angle change: ");
+    Serial.println(angleChange);
+
+    if (angleChange >= 30 &&
+        angleChange <= 400)
+    {
+      trigger3 = true;
+      trigger2 = false;
+      trigger2count = 0;
+
+      Serial.println(
+        "TRIGGER 3 ACTIVATED"
+      );
+
+      showLCD(
+        "TRIGGER 3 ACTIVE",
+        "Checking Position"
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // CONFIRM FALL AFTER ORIENTATION STABILIZES
+  // ----------------------------------------------------------
+
+  if (trigger3 == true)
+  {
+    trigger3count++;
+
+    if (trigger3count >= 10)
+    {
+      angleChange = sqrt(
+        pow(gx, 2) +
+        pow(gy, 2) +
+        pow(gz, 2)
+      );
+
+      Serial.print(
+        "Final angle change: "
+      );
+
+      Serial.println(angleChange);
+
+      if (angleChange >= 0 &&
+          angleChange <= 10)
+      {
+        fall = true;
+
+        trigger3 = false;
+        trigger3count = 0;
+
+        Serial.println(
+          "FALL DETECTED"
+        );
+
+        showLCD(
+          "FALL DETECTED!",
+          "Confirming Fall..."
+        );
+      }
+      else
+      {
+        trigger3 = false;
+        trigger3count = 0;
+
+        Serial.println(
+          "TRIGGER 3 DEACTIVATED"
+        );
+
+        showLCD(
+          "Monitoring...",
+          "No Fall Detected"
+        );
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // HANDLE CONFIRMED FALL
+  // ----------------------------------------------------------
+
+  if (fall)
+  {
+    fall = false;
+
+    unsigned long now = millis();
+
+    if (now - lastFallTime >= FALL_COOLDOWN)
+    {
+      lastFallTime = now;
+
+      Serial.println(
+        "\n*** FALL DETECTED ***"
+      );
+
+      showLCD(
+        "FALL DETECTED!",
+        "Sending SMS..."
+      );
+
+      // Start a new alarm event
+      fallAcknowledged = false;
+      buzzerAlarm();
+
+      // Send fall alert together with the latest GPS location.
+      String alertMessage =
+        "FALL DETECTED! Check person immediately.";
+      alertMessage += getGPSMessage();
+
+      Serial.println("Fall alert message:");
+      Serial.println(alertMessage);
+      Serial.print("SMS text length: ");
+      Serial.println(alertMessage.length());
+
+      bool result = sendSMS(alertMessage.c_str());
+
+      if (result)
+      {
+        Serial.println(
+          "Fall alert SMS submitted."
+        );
+
+        // Do not overwrite the acknowledgement screen if the button
+        // was pressed while the modem was submitting the SMS.
+        if (!fallAcknowledged)
+        {
+          showLCD(
+            "Fall Alert Sent",
+            "SMS Submitted"
+          );
+        }
+      }
+      else
+      {
+        Serial.println(
+          "Fall alert SMS failed."
+        );
+
+        if (!fallAcknowledged)
+        {
+          showLCD(
+            "SMS Failed!",
+            "Check GSM"
+          );
+        }
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // RESET TRIGGER 2
+  // ----------------------------------------------------------
+
+  if (trigger2count >= 6)
+  {
+    trigger2 = false;
+    trigger2count = 0;
+
+    Serial.println(
+      "TRIGGER 2 DEACTIVATED"
+    );
+
+    if (!trigger1 && !trigger3)
+    {
+      showLCD(
+        "Monitoring...",
+        "No Fall Detected"
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // RESET TRIGGER 1
+  // ----------------------------------------------------------
+
+  if (trigger1count >= 6)
+  {
+    trigger1 = false;
+    trigger1count = 0;
+
+    Serial.println(
+      "TRIGGER 1 DEACTIVATED"
+    );
+
+    if (!trigger2 && !trigger3)
+    {
+      showLCD(
+        "Monitoring...",
+        "No Fall Detected"
+      );
+    }
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1500);
+
+  // Initialize GPS UART (GPS TX -> GPIO19, GPS RX -> GPIO23)
+  GPS_Serial.begin(
+    GPS_BAUD,
+    SERIAL_8N1,
+    GPS_RX,
+    GPS_TX
+  );
+  Serial.println("GPS UART initialized.");
+
+  // Initialize shared I2C bus
+  Wire.begin(
+    I2C_SDA,
+    I2C_SCL
+  );
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+
+  showLCD(
+    "Fall Detection",
+    "System Starting"
+  );
+
+  delay(1500);
+
+  // Initialize Hall and capacitive sensors, plus buzzer/button
+  pinMode(HALL_PIN, INPUT);
+  pinMode(CAP_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  lastButtonReading = digitalRead(BUTTON_PIN);
+  stableButtonState = lastButtonReading;
+  hallValue = digitalRead(HALL_PIN);
+  hallClosed = (hallValue == HALL_CLOSED_STATE);
+  previousHallClosed = hallClosed;
+
+  capacitiveValue = digitalRead(CAP_PIN);
+  humanDetected = (capacitiveValue == CAP_DETECTED_STATE);
+  previousHumanDetected = humanDetected;
+
+  Serial.print("Initial belt status: ");
+  Serial.println(hallClosed ? "CLOSED" : "OPEN");
+  Serial.print("Initial capacitive status: ");
+  Serial.println(humanDetected ? "HUMAN/CONTACT DETECTED" : "NOT DETECTED");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+  // ----------------------------------------------------------
+  // INITIALIZE MPU6050
+  // ----------------------------------------------------------
+
+  showLCD(
+    "Initializing",
+    "MPU6050..."
+  );
+
+  Serial.println(
+    "\nInitializing MPU6050..."
+  );
+
+  Wire.beginTransmission(MPU_addr);
+
+  // Wake up MPU6050
+  Wire.write(0x6B);
+  Wire.write(0x00);
+
+  byte mpuResult =
+    Wire.endTransmission(true);
+
+  if (mpuResult == 0)
+  {
+    mpuOK = true;
+
+    Serial.println(
+      "MPU6050 ready."
+    );
+
+    showLCD(
+      "MPU6050 Ready",
+      "Sensor OK"
+    );
+
+    delay(1200);
+  }
+  else
+  {
+    mpuOK = false;
+
+    Serial.println(
+      "MPU6050 not found."
+    );
+
+    showLCD(
+      "MPU6050 Error",
+      "Check Wiring"
+    );
+
+    delay(1500);
+  }
+
+  // ----------------------------------------------------------
+  // INITIALIZE A7670C
+  // ----------------------------------------------------------
+
+  SerialAT.begin(
+    MODEM_BAUD,
+    SERIAL_8N1,
+    MODEM_RX,
+    MODEM_TX
+  );
+
+  delay(3000);
+
+  showLCD(
+    "Testing GSM...",
+    "Please wait"
+  );
+
+  Serial.println(
+    "\nTesting A7670C modem..."
+  );
+
+  if (sendAT("AT", 5000))
+  {
+    modemOK = true;
+
+    showLCD(
+      "GSM Connected",
+      "Checking SIM"
+    );
+
+    sendAT("ATI", 3000);
+
+    sendAT(
+      "AT+CPIN?",
+      3000
+    );
+
+    sendAT(
+      "AT+CSQ",
+      3000
+    );
+
+    showLCD(
+      "Checking Network",
+      "Please wait"
+    );
+
+    sendAT(
+      "AT+CEREG?",
+      3000
+    );
+
+    Serial.println(
+      "\nModem communication OK."
+    );
+
+    showLCD(
+      "GSM Test Done",
+      "System Ready"
+    );
+
+    delay(1500);
+  }
+  else
+  {
+    modemOK = false;
+
+    Serial.println(
+      "Modem not responding."
+    );
+
+    Serial.println(
+      "Check power, TX/RX and baud rate."
+    );
+
+    showLCD(
+      "GSM Not Ready",
+      "Check Wiring"
+    );
+
+    delay(1500);
+  }
+
+  Serial.println(
+    "\nSystem ready."
+  );
+
+  Serial.println(
+    "Type S to send a test SMS."
+  );
+
+  showLCD(
+    "Monitoring...",
+    mpuOK ? "Sensor Ready" : "MPU Error"
+  );
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop()
+{
+  // Keep GPS parser updated continuously (unchanged)
+  readGPSData();
+
+  // Service button and 30-minute alarm without blocking the loop
+  serviceAlarmAndButton();
+
+  // Check Hall sensor first, then capacitive sensor.
+  readHallSensor();
+  readCapacitiveSensor();
+
+  // Original fall detection runs only if belt is closed and human/contact detected.
+  checkFall();
+
+  // Show belt state on LCD while idle; trigger/fall messages remain visible
+  updateBeltLCD();
+
+  // Read commands from Serial Monitor
+  while (Serial.available())
+  {
+    char c = Serial.read();
+
+    // Type S in Serial Monitor to send a test SMS
+    if (c == 'S' || c == 's')
+    {
+      sendSMS(
+        "Test SMS from ESP32 DevKit V1 "
+        "using SIMCom A7670C."
+      );
+    }
+    else
+    {
+      // Forward other characters to the modem
+      SerialAT.write(c);
+    }
+  }
+
+  // Print unsolicited modem messages when
+  // no SMS response is currently being read.
+  if (!smsInProgress)
+  {
+    while (SerialAT.available())
+    {
+      Serial.write(
+        SerialAT.read()
+      );
+    }
+  }
+
+  delay(100);
+}
